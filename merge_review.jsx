@@ -7,9 +7,6 @@ import {
   FileCode, Play, Loader, X, Check,
 } from 'lucide-react';
 
-// ════════════════════════════════════════════════════════════════════
-// CONSTANTS
-// ════════════════════════════════════════════════════════════════════
 const SERIF = 'ui-serif, Georgia, "Times New Roman", serif';
 const MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
 const COLORS = {
@@ -40,9 +37,74 @@ const SHARED_COLS = [
 ];
 const CSV_ONLY_COLS = ['Vendor Comments', 'InSpec Control Body'];
 
-// ════════════════════════════════════════════════════════════════════
-// HELPERS
-// ════════════════════════════════════════════════════════════════════
+const SIDE = { XLSX: 'xlsx', CSV: 'csv' };
+const SOURCE = { XLSX: 'XLSX', CSV: 'CSV' };
+
+const PILL_BASE = {
+  padding: '1px 7px',
+  borderRadius: 2,
+  fontSize: 10,
+  letterSpacing: '0.06em',
+  textTransform: 'uppercase',
+  fontWeight: 600,
+  justifySelf: 'start',
+};
+
+const DEC_PILL = {
+  [SIDE.XLSX]: { background: COLORS.xlsxSoft, color: COLORS.xlsx, label: 'XLSX kept' },
+  [SIDE.CSV]:  { background: COLORS.csvSoft, color: COLORS.csv,  label: 'CSV used' },
+};
+
+const SOURCE_PALETTE = {
+  [SOURCE.XLSX]: { fg: COLORS.xlsx, bg: COLORS.xlsxSoft, label: 'XLSX kept' },
+  [SOURCE.CSV]:  { fg: COLORS.csv,  bg: COLORS.csvSoft,  label: 'CSV used' },
+};
+
+const STATUS_PILL = {
+  done:    { background: COLORS.addBg, color: COLORS.addFg },
+  partial: { background: COLORS.csvSoft, color: COLORS.csv },
+  open:    { background: COLORS.ruleSoft, color: COLORS.inkFaint },
+};
+
+function SummaryLine({ column, pill, value, valueNode, valueTitle }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '160px 70px 1fr', gap: 12, padding: '4px 0', alignItems: 'baseline' }}>
+      <span style={{ color: COLORS.inkSoft }}>{column}</span>
+      <span style={{ ...PILL_BASE, background: pill.background, color: pill.color }}>{pill.label}</span>
+      <span style={{ color: COLORS.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={valueTitle}>
+        {valueNode || value}
+      </span>
+    </div>
+  );
+}
+
+const cellKey = (xi, col) => `${xi}|${col}`;
+const conflictId = (xi, col) => `r${xi + 2}_${col.replace(/\s+/g, '_')}`;
+const xlsxIndexToRow = (xi) => xi + 2;
+
+function groupByKey(rows) {
+  const m = new Map();
+  rows.forEach((r, i) => {
+    const k = buildKey(r);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(i);
+  });
+  return m;
+}
+
+function bucketByXlsxRow(byRow, row, seed, defaults) {
+  if (!byRow.has(row)) {
+    byRow.set(row, {
+      xlsxRow: row,
+      stigid: seed?.stigid || '',
+      srgid: seed?.srgid || '',
+      cci: seed?.cci || '',
+      ...defaults,
+    });
+  }
+  return byRow.get(row);
+}
+
 function clean(s) {
   if (s === null || s === undefined) return '';
   const str = String(s).trim();
@@ -153,9 +215,6 @@ function diffWords(a, b) {
   return out;
 }
 
-// ════════════════════════════════════════════════════════════════════
-// MERGE ENGINE — port of the Python merge
-// ════════════════════════════════════════════════════════════════════
 function findLatestGovIteration(xlsxRows) {
   if (xlsxRows.length === 0) return null;
   const headers = Object.keys(xlsxRows[0]);
@@ -188,22 +247,10 @@ function runMerge(csvRows, xlsxRows) {
   const log = [];
   log.push(`CSV: ${csvRows.length} rows · XLSX: ${xlsxRows.length} rows`);
 
-  // 1. group by SRGID + CCI
-  const csvByKey = new Map();
-  const xlsxByKey = new Map();
-  csvRows.forEach((r, i) => {
-    const k = buildKey(r);
-    if (!csvByKey.has(k)) csvByKey.set(k, []);
-    csvByKey.get(k).push(i);
-  });
-  xlsxRows.forEach((r, i) => {
-    const k = buildKey(r);
-    if (!xlsxByKey.has(k)) xlsxByKey.set(k, []);
-    xlsxByKey.get(k).push(i);
-  });
+  const csvByKey = groupByKey(csvRows);
+  const xlsxByKey = groupByKey(xlsxRows);
   log.push(`Unique SRGID+CCI keys: CSV=${csvByKey.size}, XLSX=${xlsxByKey.size}, shared=${[...csvByKey.keys()].filter((k) => xlsxByKey.has(k)).length}`);
 
-  // 2. pair rows
   const xlsxToCsv = new Map();
   const matchMethod = new Map();
   const ambiguousXlsx = new Set();
@@ -259,10 +306,9 @@ function runMerge(csvRows, xlsxRows) {
   for (let i = 0; i < xlsxRows.length; i++) if (!xlsxToCsv.has(i)) unmatchedXlsxIdxAll.push(i);
   log.push(`New CSV rows: ${newCsvIdx.length} · Unmatched XLSX: ${unmatchedXlsxIdxAll.length} (${ambiguousXlsx.size} ambiguous)`);
 
-  // 3. detect conflicts and apply auto-resolve
   const conflicts = [];
   const autoResolved = [];
-  const resolvedCells = new Map(); // "xi|col" -> chosenValue
+  const resolvedCells = new Map();
   const conflictCellSet = new Set();
 
   for (const [xi, ci] of xlsxToCsv) {
@@ -283,14 +329,14 @@ function runMerge(csvRows, xlsxRows) {
         let chosen = null;
         let source = null;
         let reason = null;
-        if (xC && cG) { chosen = xv; source = 'XLSX'; reason = "XLSX has 'Chainguard OS', CSV has 'operating system'"; }
-        else if (cC && xG) { chosen = cv; source = 'CSV'; reason = "CSV has 'Chainguard OS', XLSX has 'operating system'"; }
-        else if (xC && !cC) { chosen = xv; source = 'XLSX'; reason = "XLSX has 'Chainguard OS', CSV does not"; }
-        else if (cC && !xC) { chosen = cv; source = 'CSV'; reason = "CSV has 'Chainguard OS', XLSX does not"; }
+        if (xC && cG) { chosen = xv; source = SOURCE.XLSX; reason = "XLSX has 'Chainguard OS', CSV has 'operating system'"; }
+        else if (cC && xG) { chosen = cv; source = SOURCE.CSV; reason = "CSV has 'Chainguard OS', XLSX has 'operating system'"; }
+        else if (xC && !cC) { chosen = xv; source = SOURCE.XLSX; reason = "XLSX has 'Chainguard OS', CSV does not"; }
+        else if (cC && !xC) { chosen = cv; source = SOURCE.CSV; reason = "CSV has 'Chainguard OS', XLSX does not"; }
         if (chosen !== null) {
-          resolvedCells.set(`${xi}|${col}`, chosen);
+          resolvedCells.set(cellKey(xi, col), chosen);
           autoResolved.push({
-            xlsxRow: xi + 2,
+            xlsxRow: xlsxIndexToRow(xi),
             stigid: clean(cr['STIGID']),
             srgid: clean(xr['SRGID']),
             cci: clean(xr['CCI']),
@@ -305,10 +351,10 @@ function runMerge(csvRows, xlsxRows) {
         }
       }
 
-      conflictCellSet.add(`${xi}|${col}`);
+      conflictCellSet.add(cellKey(xi, col));
       conflicts.push({
-        id: `r${xi + 2}_${col.replace(/\s+/g, '_')}`,
-        xlsxRow: xi + 2,
+        id: conflictId(xi, col),
+        xlsxRow: xlsxIndexToRow(xi),
         xlsxIndex: xi,
         csvIndex: ci,
         stigid: clean(cr['STIGID']),
@@ -323,7 +369,6 @@ function runMerge(csvRows, xlsxRows) {
   }
   log.push(`Conflicts: ${conflicts.length} need review · Auto-resolved: ${autoResolved.length}`);
 
-  // 4. government comments
   const iter = findLatestGovIteration(xlsxRows);
   const comments = [];
   if (iter) {
@@ -336,8 +381,8 @@ function runMerge(csvRows, xlsxRows) {
       const gc = clean(r[iter.govCommentColumn]);
       if (!isMeaningfulComment(gc)) return;
       comments.push({
-        id: `comment_r${i + 2}`,
-        xlsxRow: i + 2,
+        id: `comment_r${xlsxIndexToRow(i)}`,
+        xlsxRow: xlsxIndexToRow(i),
         xlsxIndex: i,
         stigid: csvStigLookup.get(buildKey(r)) || '',
         srgid: clean(r['SRGID']),
@@ -363,7 +408,7 @@ function runMerge(csvRows, xlsxRows) {
     pairings: Object.fromEntries(xlsxToCsv),
     matchMethod: Object.fromEntries(matchMethod),
     resolvedCellsMap: Object.fromEntries(resolvedCells),
-    conflictCellSet: [...conflictCellSet],
+    conflictCellSet,
     iteration: iter,
     log,
     metadata: {
@@ -379,9 +424,6 @@ function runMerge(csvRows, xlsxRows) {
   };
 }
 
-// ════════════════════════════════════════════════════════════════════
-// XLSX WRITER — apply decisions and write the workbook (ExcelJS)
-// ════════════════════════════════════════════════════════════════════
 // ExcelJS cell.value can be string | number | Date | { richText: [...] } |
 // { hyperlink, text } | { formula, result } | { error } — coerce to string.
 function cellText(value) {
@@ -399,21 +441,23 @@ function cellText(value) {
   return String(value);
 }
 
-function getColumnMap(ws) {
-  const map = new Map();
-  const headerRow = ws.getRow(1);
-  headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+function readHeaders(ws) {
+  const byName = new Map();
+  const byCol = {};
+  ws.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
     const name = cellText(cell.value).trim();
-    if (name) map.set(name, colNumber);
+    if (name) {
+      byName.set(name, colNumber);
+      byCol[colNumber] = name;
+    }
   });
-  return map;
+  return { byName, byCol };
 }
 
 async function applyAndExport({ workbook, csvRows, mergeResult, decisions, responses, originalFileName }) {
   const ws = workbook.getWorksheet('DataTable') || workbook.worksheets[0];
-  const colMap = getColumnMap(ws);
+  const colMap = readHeaders(ws).byName;
 
-  // 0. Add CSV-only columns (Vendor Comments, InSpec Control Body) at the right
   let nextCol = ws.columnCount + 1;
   for (const colName of CSV_ONLY_COLS) {
     if (!colMap.has(colName)) {
@@ -424,12 +468,10 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
     }
   }
 
-  // 1. For each matched pair, write STIGID, fill empty cells, apply auto-resolved + chosen CSV values
   for (const [xiStr, ci] of Object.entries(mergeResult.pairings)) {
     const xi = parseInt(xiStr, 10);
     const cr = csvRows[ci];
-    const excelRow = xi + 2; // ExcelJS is 1-indexed; xi=0 maps to row 2 (row 1 is header)
-    const row = ws.getRow(excelRow);
+    const row = ws.getRow(xlsxIndexToRow(xi));
 
     if (colMap.has('STIGID')) {
       row.getCell(colMap.get('STIGID')).value = clean(cr['STIGID']);
@@ -443,16 +485,15 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
       const cell = row.getCell(cIdx);
       const existingVal = clean(cellText(cell.value));
 
-      const key = `${xi}|${col}`;
+      const key = cellKey(xi, col);
 
       if (mergeResult.resolvedCellsMap[key] !== undefined) {
         cell.value = mergeResult.resolvedCellsMap[key];
         continue;
       }
 
-      if (mergeResult.conflictCellSet.includes(key)) {
-        const confId = `r${xi + 2}_${col.replace(/\s+/g, '_')}`;
-        if (decisions[confId] === 'csv') {
+      if (mergeResult.conflictCellSet.has(key)) {
+        if (decisions[conflictId(xi, col)] === SIDE.CSV) {
           cell.value = csvVal;
         }
         continue;
@@ -470,20 +511,18 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
     }
   }
 
-  // 2. Write vendor responses for comments
   if (mergeResult.iteration && mergeResult.iteration.vendorResponseColumn) {
     const venCol = colMap.get(mergeResult.iteration.vendorResponseColumn);
     if (venCol !== undefined) {
       for (const cmt of mergeResult.comments) {
         const resp = (responses[cmt.id] || '').trim();
         if (resp) {
-          ws.getRow(cmt.xlsxIndex + 2).getCell(venCol).value = resp;
+          ws.getRow(xlsxIndexToRow(cmt.xlsxIndex)).getCell(venCol).value = resp;
         }
       }
     }
   }
 
-  // 3. Append new rows from CSV
   let newRowR = ws.rowCount + 1;
   for (const ci of mergeResult.newCsvIdx) {
     const cr = csvRows[ci];
@@ -495,7 +534,6 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
     newRowR++;
   }
 
-  // 4. Write to Blob and trigger download. ExcelJS preserves all cell formatting.
   const buf = await workbook.xlsx.writeBuffer();
   const blob = new Blob([buf], {
     type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -513,15 +551,10 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
   }, 200);
 }
 
-// ════════════════════════════════════════════════════════════════════
-// APP
-// ════════════════════════════════════════════════════════════════════
 export default function App() {
-  // Stage: 'import' → 'merging' → 'review' (and within review: subview)
   const [stage, setStage] = useState('import');
-  const [view, setView] = useState('review'); // 'review' | 'comments' | 'list' | 'help'
+  const [view, setView] = useState('review');
 
-  // File state
   const [csvFile, setCsvFile] = useState(null);
   const [xlsxFile, setXlsxFile] = useState(null);
   const [csvRows, setCsvRows] = useState(null);
@@ -544,39 +577,30 @@ export default function App() {
   const conflicts = mergeResult?.conflicts || [];
   const comments = mergeResult?.comments || [];
 
-  // Build a per-row review queue: one entry per XLSX row that has either
-  // conflicts, a government comment, or both. All conflicts on a row share a
-  // single screen with the row's comment (if any) below them.
   const reviewItems = useMemo(() => {
     if (!mergeResult) return [];
-    const byRow = new Map(); // xlsxRow → item
-
-    const ensure = (row, srcConflict, srcComment) => {
-      if (!byRow.has(row)) {
-        const seed = srcConflict || srcComment;
-        byRow.set(row, {
-          key: `row_${row}`,
-          xlsxRow: row,
-          stigid: seed.stigid,
-          srgid: seed.srgid,
-          cci: seed.cci,
-          matchMethod: srcConflict?.matchMethod || null,
-          conflicts: [],
-          comment: null,
-        });
-      }
-      return byRow.get(row);
-    };
-
-    for (const c of conflicts) {
-      const it = ensure(c.xlsxRow, c, null);
+    const byRow = new Map();
+    for (const c of mergeResult.conflicts) {
+      const it = bucketByXlsxRow(byRow, c.xlsxRow, c, {
+        key: `row_${c.xlsxRow}`,
+        matchMethod: c.matchMethod || null,
+        conflicts: [],
+        comment: null,
+      });
       it.conflicts.push(c);
       if (!it.matchMethod && c.matchMethod) it.matchMethod = c.matchMethod;
     }
-    for (const cm of comments) ensure(cm.xlsxRow, null, cm).comment = cm;
-
+    for (const cm of mergeResult.comments) {
+      const it = bucketByXlsxRow(byRow, cm.xlsxRow, cm, {
+        key: `row_${cm.xlsxRow}`,
+        matchMethod: null,
+        conflicts: [],
+        comment: null,
+      });
+      it.comment = cm;
+    }
     return [...byRow.values()].sort((a, b) => a.xlsxRow - b.xlsxRow);
-  }, [mergeResult, conflicts, comments]);
+  }, [mergeResult]);
 
   const datasetKey = useMemo(() => {
     if (!csvFile || !xlsxFile) return null;
@@ -653,14 +677,7 @@ export default function App() {
       await wb.xlsx.load(buf);
       const ws = wb.getWorksheet('DataTable') || wb.worksheets[0];
 
-      // Build header → column index map from row 1
-      const headers = {};
-      ws.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
-        const name = cellText(cell.value).trim();
-        if (name) headers[colNumber] = name;
-      });
-
-      // Build row objects from data rows
+      const headers = readHeaders(ws).byCol;
       const rows = [];
       const lastCol = Math.max(...Object.keys(headers).map(Number));
       for (let r = 2; r <= ws.rowCount; r++) {
@@ -727,8 +744,8 @@ export default function App() {
   const rowDecidedCount = rowConflicts.filter((c) => decisions[c.id]).length;
 
   const decidedCount = Object.keys(decisions).length;
-  const xlsxKept = Object.values(decisions).filter((v) => v === 'xlsx').length;
-  const csvChosen = Object.values(decisions).filter((v) => v === 'csv').length;
+  const xlsxKept = Object.values(decisions).filter((v) => v === SIDE.XLSX).length;
+  const csvChosen = Object.values(decisions).filter((v) => v === SIDE.CSV).length;
   const remaining = conflicts.length - decidedCount;
 
   const respondedCount = Object.values(responses).filter((v) => (v || '').trim()).length;
@@ -833,37 +850,25 @@ export default function App() {
     }
   };
 
-  // ── Summary data: row-by-row breakdown of every change written to the export
   const summary = useMemo(() => {
     if (!mergeResult) return null;
     const rowMap = new Map();
-    const ensure = (row, seed) => {
-      if (!rowMap.has(row)) {
-        rowMap.set(row, {
-          xlsxRow: row,
-          stigid: seed?.stigid || '',
-          srgid: seed?.srgid || '',
-          cci: seed?.cci || '',
-          decided: [], skipped: [], autoResolved: [], response: null,
-        });
-      }
-      return rowMap.get(row);
-    };
-    for (const c of conflicts) {
+    const seedDefaults = { decided: [], skipped: [], autoResolved: [], response: null };
+    for (const c of mergeResult.conflicts) {
       const dec = decisions[c.id];
-      const e = ensure(c.xlsxRow, c);
-      if (dec === 'csv') e.decided.push({ column: c.column, side: 'CSV', value: c.csvValue, replaced: c.xlsxValue });
-      else if (dec === 'xlsx') e.decided.push({ column: c.column, side: 'XLSX', value: c.xlsxValue, replaced: c.csvValue });
+      const e = bucketByXlsxRow(rowMap, c.xlsxRow, c, seedDefaults);
+      if (dec === SIDE.CSV) e.decided.push({ column: c.column, side: SOURCE.CSV, value: c.csvValue, replaced: c.xlsxValue });
+      else if (dec === SIDE.XLSX) e.decided.push({ column: c.column, side: SOURCE.XLSX, value: c.xlsxValue, replaced: c.csvValue });
       else e.skipped.push({ column: c.column, value: c.xlsxValue });
     }
     for (const ar of mergeResult.autoResolved || []) {
-      const e = ensure(ar.xlsxRow, ar);
+      const e = bucketByXlsxRow(rowMap, ar.xlsxRow, ar, seedDefaults);
       e.autoResolved.push({ column: ar.column, source: ar.chosenSource, value: ar.resolvedValue, reason: ar.reason });
     }
-    for (const cm of comments) {
+    for (const cm of mergeResult.comments) {
       const resp = (responses[cm.id] || '').trim();
       if (!resp) continue;
-      const e = ensure(cm.xlsxRow, cm);
+      const e = bucketByXlsxRow(rowMap, cm.xlsxRow, cm, seedDefaults);
       e.response = { iterationLabel: cm.iterationLabel, govComment: cm.govComment, text: resp };
     }
     const rows = [...rowMap.values()].sort((a, b) => a.xlsxRow - b.xlsxRow);
@@ -873,8 +878,14 @@ export default function App() {
       return { stigid: clean(r['STIGID']), srgid: clean(r['SRGID']), cci: clean(r['CCI']) };
     });
 
-    const totalCsvChosen = rows.reduce((n, r) => n + r.decided.filter((d) => d.side === 'CSV').length, 0);
-    const totalXlsxChosen = rows.reduce((n, r) => n + r.decided.filter((d) => d.side === 'XLSX').length, 0);
+    let totalCsvChosen = 0;
+    let totalXlsxChosen = 0;
+    for (const r of rows) {
+      for (const d of r.decided) {
+        if (d.side === SOURCE.CSV) totalCsvChosen++;
+        else if (d.side === SOURCE.XLSX) totalXlsxChosen++;
+      }
+    }
     const totalSkipped = rows.reduce((n, r) => n + r.skipped.length, 0);
     const totalResponses = rows.filter((r) => r.response).length;
     const totalAutoResolved = mergeResult.autoResolved?.length || 0;
@@ -884,7 +895,7 @@ export default function App() {
       newRows,
       stats: { totalCsvChosen, totalXlsxChosen, totalSkipped, totalResponses, totalAutoResolved, totalNewRows: newRows.length },
     };
-  }, [mergeResult, conflicts, comments, decisions, responses, csvRows]);
+  }, [mergeResult, decisions, responses, csvRows]);
 
   // ── Style helpers
   const iconBtn = (active = false) => ({
@@ -906,16 +917,13 @@ export default function App() {
 
   const renderDiffSide = (op, side) => {
     if (op.type === 'eq') return <span style={{ color: COLORS.ink }}>{op.text}</span>;
-    if (side === 'xlsx' && op.type === 'del')
+    if (side === SIDE.XLSX && op.type === 'del')
       return <span style={{ background: COLORS.delBg, color: COLORS.delFg, padding: '1px 2px', borderRadius: 2, fontWeight: 500 }}>{op.text}</span>;
-    if (side === 'csv' && op.type === 'add')
+    if (side === SIDE.CSV && op.type === 'add')
       return <span style={{ background: COLORS.addBg, color: COLORS.addFg, padding: '1px 2px', borderRadius: 2, fontWeight: 500 }}>{op.text}</span>;
     return null;
   };
 
-  // ════════════════════════════════════════════════════════════════════
-  // RENDER
-  // ════════════════════════════════════════════════════════════════════
   return (
     <div style={{ background: COLORS.bg, minHeight: '100vh', fontFamily: SERIF, color: COLORS.ink, lineHeight: 1.5 }}>
       <div style={{ maxWidth: 1280, margin: '0 auto', padding: '32px 28px 80px' }}>
@@ -1002,7 +1010,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════ STAGE: IMPORT ════════════ */}
         {stage === 'import' && (
           <div style={{ marginTop: 36 }}>
             <div style={{ marginBottom: 28 }}>
@@ -1140,7 +1147,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════ STAGE: MERGING ════════════ */}
         {stage === 'merging' && (
           <div style={{ marginTop: 80, textAlign: 'center' }}>
             <Loader size={32} color={COLORS.inkSoft} style={{ animation: 'spin 1s linear infinite' }} />
@@ -1157,7 +1163,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════ STAGE: REVIEW — Help ════════════ */}
         {stage === 'review' && view === 'help' && (
           <div style={{ marginTop: 36, padding: '28px 32px', background: COLORS.paper, border: '1px solid ' + COLORS.rule, maxWidth: 760 }}>
             <h2 style={{ fontSize: 24, fontWeight: 600, margin: '0 0 16px', letterSpacing: '-0.01em' }}>How this works</h2>
@@ -1192,7 +1197,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════ STAGE: REVIEW — Summary ════════════ */}
         {stage === 'review' && view === 'summary' && summary && (
           <div style={{ marginTop: 36 }}>
             <div style={{ borderBottom: '1px solid ' + COLORS.rule, paddingBottom: 18 }}>
@@ -1239,39 +1243,33 @@ export default function App() {
                   </div>
                   <div style={{ padding: '10px 14px', fontFamily: MONO, fontSize: 12, lineHeight: 1.6 }}>
                     {r.decided.map((d, i) => {
-                      const sideColor = d.side === 'CSV' ? COLORS.csv : COLORS.xlsx;
-                      const sideBg = d.side === 'CSV' ? COLORS.csvSoft : COLORS.xlsxSoft;
+                      const pal = SOURCE_PALETTE[d.side];
                       return (
-                        <div key={'d' + i} style={{ display: 'grid', gridTemplateColumns: '160px 70px 1fr', gap: 12, padding: '4px 0', alignItems: 'baseline' }}>
-                          <span style={{ color: COLORS.inkSoft }}>{d.column}</span>
-                          <span style={{ background: sideBg, color: sideColor, padding: '1px 7px', borderRadius: 2, fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase', fontWeight: 600, justifySelf: 'start' }}>
-                            {d.side === 'CSV' ? 'CSV used' : 'XLSX kept'}
-                          </span>
-                          <span style={{ color: COLORS.ink, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={d.value}>
-                            {(d.value || '').slice(0, 200).replace(/\s+/g, ' ')}
-                          </span>
-                        </div>
+                        <SummaryLine
+                          key={'d' + i}
+                          column={d.column}
+                          pill={{ background: pal.bg, color: pal.fg, label: pal.label }}
+                          value={(d.value || '').slice(0, 200).replace(/\s+/g, ' ')}
+                          valueTitle={d.value}
+                        />
                       );
                     })}
                     {r.skipped.map((s, i) => (
-                      <div key={'s' + i} style={{ display: 'grid', gridTemplateColumns: '160px 70px 1fr', gap: 12, padding: '4px 0', alignItems: 'baseline' }}>
-                        <span style={{ color: COLORS.inkSoft }}>{s.column}</span>
-                        <span style={{ background: COLORS.warnBg, color: COLORS.warn, padding: '1px 7px', borderRadius: 2, fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase', fontWeight: 600, justifySelf: 'start' }}>
-                          skipped
-                        </span>
-                        <span style={{ color: COLORS.inkFaint, fontStyle: 'italic' }}>no decision · XLSX kept by default</span>
-                      </div>
+                      <SummaryLine
+                        key={'s' + i}
+                        column={s.column}
+                        pill={{ background: COLORS.warnBg, color: COLORS.warn, label: 'skipped' }}
+                        valueNode={<span style={{ color: COLORS.inkFaint, fontStyle: 'italic' }}>no decision · XLSX kept by default</span>}
+                      />
                     ))}
                     {r.autoResolved.map((a, i) => (
-                      <div key={'a' + i} style={{ display: 'grid', gridTemplateColumns: '160px 70px 1fr', gap: 12, padding: '4px 0', alignItems: 'baseline' }}>
-                        <span style={{ color: COLORS.inkSoft }}>{a.column}</span>
-                        <span style={{ background: COLORS.addBg, color: COLORS.addFg, padding: '1px 7px', borderRadius: 2, fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase', fontWeight: 600, justifySelf: 'start' }}>
-                          auto · {a.source}
-                        </span>
-                        <span style={{ color: COLORS.ink }} title={a.value}>
-                          <span style={{ color: COLORS.inkSoft, fontStyle: 'italic' }}>{a.reason}</span>
-                        </span>
-                      </div>
+                      <SummaryLine
+                        key={'a' + i}
+                        column={a.column}
+                        pill={{ background: COLORS.addBg, color: COLORS.addFg, label: `auto · ${a.source}` }}
+                        valueTitle={a.value}
+                        valueNode={<span style={{ color: COLORS.inkSoft, fontStyle: 'italic' }}>{a.reason}</span>}
+                      />
                     ))}
                     {r.response && (
                       <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px dashed ' + COLORS.ruleSoft }}>
@@ -1315,7 +1313,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════ STAGE: REVIEW — List (per-row summary) ════════════ */}
         {stage === 'review' && view === 'list' && (
           <div style={{ marginTop: 36, border: '1px solid ' + COLORS.rule, background: COLORS.paper, maxHeight: '70vh', overflowY: 'auto' }}>
             <div style={{ display: 'grid', gridTemplateColumns: '50px 70px 130px 1fr 70px 80px', gap: 12, padding: '10px 16px', background: COLORS.bg, fontFamily: MONO, fontSize: 10, letterSpacing: '0.05em', textTransform: 'uppercase', color: COLORS.inkFaint, fontWeight: 600, borderBottom: '1px solid ' + COLORS.rule, position: 'sticky', top: 0 }}>
@@ -1331,9 +1328,7 @@ export default function App() {
               const allDone = (total === 0 || conflictsDone) && (!hasComment || hasResp);
               const noneDone = decided === 0 && !hasResp;
               const status = allDone ? 'done' : noneDone ? 'open' : 'partial';
-              const statusPill = status === 'done' ? { background: COLORS.addBg, color: COLORS.addFg }
-                               : status === 'partial' ? { background: COLORS.csvSoft, color: COLORS.csv }
-                               : { background: COLORS.ruleSoft, color: COLORS.inkFaint };
+              const statusPill = STATUS_PILL[status];
               const isCurrent = idx === currentIndex;
               const cols = item.conflicts.map((c) => c.column).join(', ');
               const conflictText = total === 0 ? '—' : `${decided}/${total} · ${cols}`;
@@ -1361,7 +1356,6 @@ export default function App() {
           </div>
         )}
 
-        {/* ════════════ STAGE: REVIEW — Per-row review ════════════ */}
         {stage === 'review' && view === 'review' && currentItem && (
           <>
             {/* Row header */}
@@ -1404,9 +1398,7 @@ export default function App() {
                 {rowConflicts.map((c, ci) => {
                   const dec = decisions[c.id];
                   const diff = diffWords(c.xlsxValue || '', c.csvValue || '');
-                  const decPill = dec === 'xlsx' ? { background: COLORS.xlsxSoft, color: COLORS.xlsx, label: 'XLSX kept' }
-                                : dec === 'csv'  ? { background: COLORS.csvSoft, color: COLORS.csv, label: 'CSV used' }
-                                : null;
+                  const decPill = DEC_PILL[dec] || null;
                   return (
                     <div key={c.id}
                          id={`conflict-${c.id}`}
@@ -1442,20 +1434,19 @@ export default function App() {
 
                       {/* XLSX diff */}
                       <div style={{ padding: '14px 14px', borderRight: '1px solid ' + COLORS.rule, fontFamily: MONO, fontSize: 13, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowY: 'auto', maxHeight: 360 }}>
-                        {diff.map((op, i) => <React.Fragment key={i}>{renderDiffSide(op, 'xlsx')}</React.Fragment>)}
+                        {diff.map((op, i) => <React.Fragment key={i}>{renderDiffSide(op, SIDE.XLSX)}</React.Fragment>)}
                       </div>
                       {/* CSV diff */}
                       <div style={{ padding: '14px 14px', fontFamily: MONO, fontSize: 13, lineHeight: 1.6, whiteSpace: 'pre-wrap', wordBreak: 'break-word', overflowY: 'auto', maxHeight: 360 }}>
-                        {diff.map((op, i) => <React.Fragment key={i}>{renderDiffSide(op, 'csv')}</React.Fragment>)}
+                        {diff.map((op, i) => <React.Fragment key={i}>{renderDiffSide(op, SIDE.CSV)}</React.Fragment>)}
                       </div>
 
-                      {/* Choose buttons */}
-                      <button onClick={() => choose(c.id, 'xlsx')}
-                              style={{ padding: '14px 16px', border: 0, borderTop: '1px solid ' + COLORS.rule, borderRight: '1px solid ' + COLORS.rule, background: dec === 'xlsx' ? COLORS.ink : COLORS.paper, color: dec === 'xlsx' ? COLORS.paper : COLORS.ink, cursor: 'pointer', fontFamily: SERIF, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+                      <button onClick={() => choose(c.id, SIDE.XLSX)}
+                              style={{ padding: '14px 16px', border: 0, borderTop: '1px solid ' + COLORS.rule, borderRight: '1px solid ' + COLORS.rule, background: dec === SIDE.XLSX ? COLORS.ink : COLORS.paper, color: dec === SIDE.XLSX ? COLORS.paper : COLORS.ink, cursor: 'pointer', fontFamily: SERIF, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
                         <ArrowLeft size={16} /><span>Keep XLSX</span>
                       </button>
-                      <button onClick={() => choose(c.id, 'csv')}
-                              style={{ padding: '14px 16px', border: 0, borderTop: '1px solid ' + COLORS.rule, background: dec === 'csv' ? COLORS.ink : COLORS.paper, color: dec === 'csv' ? COLORS.paper : COLORS.ink, cursor: 'pointer', fontFamily: SERIF, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+                      <button onClick={() => choose(c.id, SIDE.CSV)}
+                              style={{ padding: '14px 16px', border: 0, borderTop: '1px solid ' + COLORS.rule, background: dec === SIDE.CSV ? COLORS.ink : COLORS.paper, color: dec === SIDE.CSV ? COLORS.paper : COLORS.ink, cursor: 'pointer', fontFamily: SERIF, fontSize: 15, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
                         <span>Use CSV</span><ArrowRight size={16} />
                       </button>
                     </div>
