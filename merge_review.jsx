@@ -159,6 +159,19 @@ function isGenericPhrasing(val) {
   return /\boperating\s+system\b/i.test(val) && !isChainguardPreferred(val);
 }
 
+// If the ONLY difference between two cells is "operating system" ⟷ "Chainguard
+// OS" phrasing, return the "Chainguard OS" variant to auto-merge; else null.
+function canonicalizeOs(s) {
+  return norm(s).replace(/chainguard\s*os/g, '').replace(/operating\s+system/g, '');
+}
+function resolveOsPhrasing(xv, cv) {
+  if (canonicalizeOs(xv) !== canonicalizeOs(cv)) return null; // other differences too
+  const reason = 'Only difference is "operating system" → "Chainguard OS"';
+  if (isChainguardPreferred(xv)) return { chosen: xv, source: SOURCE.XLSX, reason };
+  if (isChainguardPreferred(cv)) return { chosen: cv, source: SOURCE.CSV, reason };
+  return null;
+}
+
 function isMeaningfulComment(text) {
   const t = clean(text);
   if (!t) return false;
@@ -358,17 +371,54 @@ function runMerge(csvRows, xlsxRows) {
   const resolvedCells = new Map();
   const conflictCellSet = new Set();
 
+  const pushAuto = (xi, ci, col, chosen, source, reason, xv, cv) => {
+    resolvedCells.set(cellKey(xi, col), chosen);
+    autoResolved.push({
+      xlsxRow: xlsxIndexToRow(xi),
+      stigid: clean(csvRows[ci]['STIGID']),
+      srgid: clean(xlsxRows[xi]['SRGID']),
+      cci: clean(xlsxRows[xi]['CCI']),
+      column: col,
+      chosenSource: source,
+      reason,
+      resolvedValue: chosen,
+      csvValue: cv,
+      xlsxValue: xv,
+    });
+  };
+
   for (const [xi, ci] of xlsxToCsv) {
     if (concurredXlsxIdx.has(xi)) continue;
     const xr = xlsxRows[xi];
     const cr = csvRows[ci];
+
+    // Row-level auto-merge: XLSX Status was a placeholder ("Not Yet Determined")
+    // and Vulcan now has a real determination — take the whole row from CSV.
+    const wholeRowToCsv =
+      norm(xr['Status']) === 'not yet determined' &&
+      clean(cr['Status']) !== '' &&
+      norm(cr['Status']) !== 'not yet determined';
+
     for (const col of SHARED_COLS) {
       const cv = clean(cr[col]);
       const xv = clean(xr[col]);
       if (cv === '' || xv === '') continue;
       if (norm(cv) === norm(xv)) continue;
 
-      // Auto-resolve: Requirement column "Chainguard OS" preference
+      // Row-level: Status placeholder resolved — take CSV for the whole row.
+      if (wholeRowToCsv) {
+        pushAuto(xi, ci, col, cv, SOURCE.CSV, 'Status was "Not Yet Determined" — whole row taken from CSV', xv, cv);
+        continue;
+      }
+
+      // Cell-level: only difference is "operating system" → "Chainguard OS".
+      const os = resolveOsPhrasing(xv, cv);
+      if (os) {
+        pushAuto(xi, ci, col, os.chosen, os.source, os.reason, xv, cv);
+        continue;
+      }
+
+      // Auto-resolve: Requirement column "Chainguard OS" preference (broader)
       if (col === 'Requirement') {
         const xC = isChainguardPreferred(xv);
         const cC = isChainguardPreferred(cv);
@@ -382,19 +432,7 @@ function runMerge(csvRows, xlsxRows) {
         else if (xC && !cC) { chosen = xv; source = SOURCE.XLSX; reason = "XLSX has 'Chainguard OS', CSV does not"; }
         else if (cC && !xC) { chosen = cv; source = SOURCE.CSV; reason = "CSV has 'Chainguard OS', XLSX does not"; }
         if (chosen !== null) {
-          resolvedCells.set(cellKey(xi, col), chosen);
-          autoResolved.push({
-            xlsxRow: xlsxIndexToRow(xi),
-            stigid: clean(cr['STIGID']),
-            srgid: clean(xr['SRGID']),
-            cci: clean(xr['CCI']),
-            column: col,
-            chosenSource: source,
-            reason,
-            resolvedValue: chosen,
-            csvValue: cv,
-            xlsxValue: xv,
-          });
+          pushAuto(xi, ci, col, chosen, source, reason, xv, cv);
           continue;
         }
       }
@@ -838,6 +876,16 @@ export default function App() {
     });
   }, [rowConflicts]);
 
+  // Bulk: apply one side to every conflict on the current row.
+  const chooseAllInRow = useCallback((side) => {
+    if (!rowConflicts.length) return;
+    setDecisions((d) => {
+      const n = { ...d };
+      for (const c of rowConflicts) n[c.id] = side;
+      return n;
+    });
+  }, [rowConflicts]);
+
   const setResponseFor = useCallback((commentId, text) => {
     setResponses((r) => ({ ...r, [commentId]: text }));
   }, []);
@@ -1240,8 +1288,10 @@ export default function App() {
 
             <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Auto-resolved</h3>
             <p style={{ fontSize: 14, color: COLORS.inkSoft }}>
-              {mergeResult?.autoResolved.length || 0} conflicts on the Requirement column auto-resolved by the
-              "prefer 'Chainguard OS' over 'operating system'" rule. They're applied directly without review.
+              {mergeResult?.autoResolved.length || 0} cells auto-resolved without review, by three rules:
+              (1) when XLSX <em>Status</em> was "Not Yet Determined", the whole row is taken from CSV;
+              (2) when a cell's only difference is "operating system" → "Chainguard OS", the Chainguard OS
+              wording wins; (3) on the Requirement column, the side that says "Chainguard OS" is preferred.
             </p>
 
             <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Keyboard — Review</h3>
@@ -1460,6 +1510,25 @@ export default function App() {
             {/* Conflicts — stacked, label-on-left layout */}
             {rowConflicts.length > 0 && (
               <div style={{ marginTop: 24, border: '1px solid ' + COLORS.rule, background: COLORS.paper }}>
+                {rowConflicts.length > 1 && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '10px 14px', borderBottom: '1px solid ' + COLORS.rule, background: COLORS.bg }}>
+                    <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: COLORS.inkFaint }}>
+                      {rowConflicts.length} conflicts · apply one side to all
+                    </span>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button onClick={() => chooseAllInRow(SIDE.XLSX)}
+                              title="Keep the XLSX value for every conflict on this row"
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', cursor: 'pointer', fontFamily: MONO, fontSize: 11, letterSpacing: '0.04em', textTransform: 'uppercase', border: '1px solid ' + COLORS.xlsx, background: COLORS.xlsxSoft, color: COLORS.xlsx }}>
+                        <ArrowLeft size={13} /> Keep all XLSX
+                      </button>
+                      <button onClick={() => chooseAllInRow(SIDE.CSV)}
+                              title="Use the CSV value for every conflict on this row"
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: 6, padding: '6px 12px', cursor: 'pointer', fontFamily: MONO, fontSize: 11, letterSpacing: '0.04em', textTransform: 'uppercase', border: '1px solid ' + COLORS.csv, background: COLORS.csvSoft, color: COLORS.csv }}>
+                        Use all CSV <ArrowRight size={13} />
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {rowConflicts.map((c, ci) => {
                   const dec = decisions[c.id];
                   const diff = diffWords(c.xlsxValue || '', c.csvValue || '');

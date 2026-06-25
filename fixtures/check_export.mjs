@@ -26,6 +26,17 @@ assert('V-1 vendor still Concur', get(2, '1st Vendor Response') === 'Concur');
 assert('V-2 Check kept (check two)', get(3, 'Check') === 'check two');
 assert('V-4 Requirement kept (req four)', get(5, 'Requirement') === 'req four');
 
+// V-6 (row 6): Status was "Not Yet Determined" -> whole row taken from CSV
+assert('V-6 Status taken from CSV (Open)', get(6, 'Status') === 'Open');
+assert('V-6 Check taken from CSV', get(6, 'Check') === 'check six CHANGED');
+assert('V-6 Requirement taken from CSV', get(6, 'Requirement') === 'req six CHANGED');
+
+// V-7 (row 7): only OS-phrasing diff in Requirement -> Chainguard OS wins
+assert('V-7 Requirement -> Chainguard OS', get(7, 'Requirement') === 'The Chainguard OS must lock the session.');
+
+// V-8 (row 8): OS-phrasing diff in Check; XLSX "Chainguard OS" wins over CSV generic
+assert('V-8 Check keeps Chainguard OS', get(8, 'Check') === 'Inspect the Chainguard OS audit config.');
+
 // New row V-5 appended
 let v5 = null;
 ws.eachRow((row, n) => { if (row.getCell(headers['STIGID']).value === 'V-5') v5 = n; });
