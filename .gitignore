@@ -5,3 +5,9 @@ dist/
 .env
 .env.local
 .vite/
+
+# Local test fixtures, generated outputs, and browser artifacts
+fixtures/real/
+fixtures/*.csv
+fixtures/*.xlsx
+.playwright-mcp/

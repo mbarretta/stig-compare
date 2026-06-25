@@ -243,6 +243,45 @@ function findLatestGovIteration(xlsxRows) {
   };
 }
 
+// Concurrence: a row is settled when the LATEST non-empty Government Comments
+// cell starts with "concur", OR the LATEST non-empty Vendor Response cell
+// contains "concur". Text-only (no fill color needed); "non-concur" excluded.
+// Settled rows are skipped entirely — Vulcan's data for them is stale.
+function govConcurs(text) {
+  const t = clean(text);
+  return /^concur/i.test(t) && !/^non[\s-]*concur/i.test(t);
+}
+function vendorConcurs(text) {
+  const t = clean(text);
+  return /concur/i.test(t) && !/non[\s-]*concur/i.test(t);
+}
+
+function collectIterationColumns(headers) {
+  const gov = [];
+  const vendor = [];
+  for (const h of headers) {
+    let m = h.match(/^(\d+)\w*\s+Government\s+Comments?$/i);
+    if (m) { gov.push({ n: parseInt(m[1], 10), name: h }); continue; }
+    m = h.match(/^(\d+)\w*\s+Vendor\s+Response$/i);
+    if (m) { vendor.push({ n: parseInt(m[1], 10), name: h }); }
+  }
+  gov.sort((a, b) => a.n - b.n);
+  vendor.sort((a, b) => a.n - b.n);
+  return { gov, vendor };
+}
+
+// cols sorted ascending by iteration — the last non-empty cell wins.
+function latestNonEmpty(row, cols) {
+  let val = '';
+  for (const c of cols) { const t = clean(row[c.name]); if (t) val = t; }
+  return val;
+}
+
+function rowConcurred(row, cols) {
+  return govConcurs(latestNonEmpty(row, cols.gov)) ||
+         vendorConcurs(latestNonEmpty(row, cols.vendor));
+}
+
 function runMerge(csvRows, xlsxRows) {
   const log = [];
   log.push(`CSV: ${csvRows.length} rows · XLSX: ${xlsxRows.length} rows`);
@@ -306,12 +345,21 @@ function runMerge(csvRows, xlsxRows) {
   for (let i = 0; i < xlsxRows.length; i++) if (!xlsxToCsv.has(i)) unmatchedXlsxIdxAll.push(i);
   log.push(`New CSV rows: ${newCsvIdx.length} · Unmatched XLSX: ${unmatchedXlsxIdxAll.length} (${ambiguousXlsx.size} ambiguous)`);
 
+  // Concurrence gate: settled rows (gov + vendor both concurred) are skipped.
+  const iterCols = collectIterationColumns(xlsxRows.length ? Object.keys(xlsxRows[0]) : []);
+  const concurredXlsxIdx = new Set();
+  xlsxRows.forEach((r, i) => { if (rowConcurred(r, iterCols)) concurredXlsxIdx.add(i); });
+  let concurredMatched = 0;
+  for (const xi of xlsxToCsv.keys()) if (concurredXlsxIdx.has(xi)) concurredMatched++;
+  log.push(`Concurred rows skipped: ${concurredMatched} of ${xlsxToCsv.size} matched (${concurredXlsxIdx.size} concurred total)`);
+
   const conflicts = [];
   const autoResolved = [];
   const resolvedCells = new Map();
   const conflictCellSet = new Set();
 
   for (const [xi, ci] of xlsxToCsv) {
+    if (concurredXlsxIdx.has(xi)) continue;
     const xr = xlsxRows[xi];
     const cr = csvRows[ci];
     for (const col of SHARED_COLS) {
@@ -378,6 +426,7 @@ function runMerge(csvRows, xlsxRows) {
       if (!csvStigLookup.has(k)) csvStigLookup.set(k, clean(r['STIGID']));
     }
     xlsxRows.forEach((r, i) => {
+      if (concurredXlsxIdx.has(i)) return;
       const gc = clean(r[iter.govCommentColumn]);
       if (!isMeaningfulComment(gc)) return;
       comments.push({
@@ -405,6 +454,7 @@ function runMerge(csvRows, xlsxRows) {
     newCsvIdx,
     unmatchedXlsxIdx: unmatchedXlsxIdxAll.filter((i) => !ambiguousXlsx.has(i)),
     ambiguousXlsxIdx: [...ambiguousXlsx],
+    concurredXlsxIdx: [...concurredXlsxIdx],
     pairings: Object.fromEntries(xlsxToCsv),
     matchMethod: Object.fromEntries(matchMethod),
     resolvedCellsMap: Object.fromEntries(resolvedCells),
@@ -414,6 +464,7 @@ function runMerge(csvRows, xlsxRows) {
     metadata: {
       totalConflicts: conflicts.length,
       totalComments: comments.length,
+      concurredCount: concurredMatched,
       autoResolvedCount: autoResolved.length,
       newRowsCount: newCsvIdx.length,
       unmatchedCount: unmatchedXlsxIdxAll.length - ambiguousXlsx.size,
@@ -468,8 +519,10 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
     }
   }
 
+  const concurredSet = new Set(mergeResult.concurredXlsxIdx || []);
   for (const [xiStr, ci] of Object.entries(mergeResult.pairings)) {
     const xi = parseInt(xiStr, 10);
+    if (concurredSet.has(xi)) continue; // settled row — leave untouched
     const cr = csvRows[ci];
     const row = ws.getRow(xlsxIndexToRow(xi));
 
@@ -853,22 +906,24 @@ export default function App() {
   const summary = useMemo(() => {
     if (!mergeResult) return null;
     const rowMap = new Map();
-    const seedDefaults = { decided: [], skipped: [], autoResolved: [], response: null };
+    // Fresh arrays per call — a shared defaults object would alias decided/
+    // skipped/autoResolved across every row.
+    const mkSeed = () => ({ decided: [], skipped: [], autoResolved: [], response: null });
     for (const c of mergeResult.conflicts) {
       const dec = decisions[c.id];
-      const e = bucketByXlsxRow(rowMap, c.xlsxRow, c, seedDefaults);
+      const e = bucketByXlsxRow(rowMap, c.xlsxRow, c, mkSeed());
       if (dec === SIDE.CSV) e.decided.push({ column: c.column, side: SOURCE.CSV, value: c.csvValue, replaced: c.xlsxValue });
       else if (dec === SIDE.XLSX) e.decided.push({ column: c.column, side: SOURCE.XLSX, value: c.xlsxValue, replaced: c.csvValue });
       else e.skipped.push({ column: c.column, value: c.xlsxValue });
     }
     for (const ar of mergeResult.autoResolved || []) {
-      const e = bucketByXlsxRow(rowMap, ar.xlsxRow, ar, seedDefaults);
+      const e = bucketByXlsxRow(rowMap, ar.xlsxRow, ar, mkSeed());
       e.autoResolved.push({ column: ar.column, source: ar.chosenSource, value: ar.resolvedValue, reason: ar.reason });
     }
     for (const cm of mergeResult.comments) {
       const resp = (responses[cm.id] || '').trim();
       if (!resp) continue;
-      const e = bucketByXlsxRow(rowMap, cm.xlsxRow, cm, seedDefaults);
+      const e = bucketByXlsxRow(rowMap, cm.xlsxRow, cm, mkSeed());
       e.response = { iterationLabel: cm.iterationLabel, govComment: cm.govComment, text: resp };
     }
     const rows = [...rowMap.values()].sort((a, b) => a.xlsxRow - b.xlsxRow);
@@ -940,7 +995,7 @@ export default function App() {
               <>
                 <span>{xlsxFile?.name}</span>
                 <span style={{ opacity: 0.4 }}>·</span>
-                <span>{conflicts.length} conflicts · {comments.length} comments · {reviewItems.length} rows</span>
+                <span>{conflicts.length} conflicts · {comments.length} comments · {reviewItems.length} rows{mergeResult?.metadata?.concurredCount ? ` · ${mergeResult.metadata.concurredCount} concurred skipped` : ''}</span>
                 <span style={{ opacity: 0.4 }}>·</span>
                 <div style={{ display: 'flex', gap: 4 }}>
                   <button style={iconBtn(view === 'review')} onClick={() => setView('review')}>
@@ -1176,6 +1231,13 @@ export default function App() {
               {mergeResult?.log.map((l, i) => <div key={i}>· {l}</div>)}
             </div>
 
+            <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Concurred rows skipped</h3>
+            <p style={{ fontSize: 14, color: COLORS.inkSoft }}>
+              {mergeResult?.metadata?.concurredCount || 0} matched rows are already settled — the latest Government
+              Comments cell starts with "Concur" <em>or</em> the latest Vendor Response contains "Concur". Vulcan's
+              data for these is stale, so they're skipped entirely and left untouched in the export.
+            </p>
+
             <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Auto-resolved</h3>
             <p style={{ fontSize: 14, color: COLORS.inkSoft }}>
               {mergeResult?.autoResolved.length || 0} conflicts on the Requirement column auto-resolved by the
@@ -1211,6 +1273,9 @@ export default function App() {
                 <span><strong>{summary.stats.totalAutoResolved}</strong> auto-resolved</span>
                 <span><strong>{summary.stats.totalResponses}</strong> responses entered</span>
                 <span><strong>{summary.stats.totalNewRows}</strong> new rows added</span>
+                {mergeResult?.metadata?.concurredCount > 0 && (
+                  <span><strong style={{ color: COLORS.xlsx }}>{mergeResult.metadata.concurredCount}</strong> concurred rows skipped (untouched)</span>
+                )}
               </div>
               <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <button style={iconBtn(false)} onClick={handleExport}><Download size={12} /> Re-export</button>
