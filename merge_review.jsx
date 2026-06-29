@@ -79,8 +79,7 @@ function SummaryLine({ column, pill, value, valueNode, valueTitle }) {
 }
 
 const cellKey = (xi, col) => `${xi}|${col}`;
-const conflictId = (xi, col) => `r${xi + 2}_${col.replace(/\s+/g, '_')}`;
-const xlsxIndexToRow = (xi) => xi + 2;
+const conflictId = (xi, col) => `r${xi}_${col.replace(/\s+/g, '_')}`;
 
 function groupByKey(rows) {
   const m = new Map();
@@ -295,6 +294,52 @@ function rowConcurred(row, cols) {
          vendorConcurs(latestNonEmpty(row, cols.vendor));
 }
 
+// ── Umbrella ("Satisfied By") awareness ─────────────────────────────────────
+// Many SRG controls are umbrella rows: their Vendor Comments cell carries a
+// "Satisfied By: CGOS-…, CGOS-…" list naming the concrete base rules that
+// satisfy them. For those rows the Check/Fix cell is NOT authored content — it
+// is a *rendering* of one of the satisfying base rules (the first one listed),
+// so it changes between exports purely because that list gets reordered, even
+// when the control's actual requirements are identical. We therefore compare
+// the Satisfied-By SET (order-independent) instead of the Check/Fix text:
+//   · set unchanged → keep the baseline XLSX text, no conflict (avoids churn);
+//   · set changed   → real requirement change, surfaced as a conflict with the
+//                     added/removed base rules shown.
+// Leaf controls (no Satisfied-By list) keep the normal text comparison.
+const UMBRELLA_DERIVED_COLS = new Set(['Check', 'Fix']);
+
+// A "concurred" row is otherwise settled and skipped, but the Vulcan export can
+// still carry a live, unresolved divergence in the audit-critical columns (a row
+// can read "Concur…" while the export's Check/Fix/Status disagree with the
+// baseline). For concurred rows we therefore re-examine ONLY these columns and
+// surface any post-auto-resolve divergence as a conflict tagged "previously
+// concurred"; every other column on a settled row stays untouched.
+const CONCURRED_REVIEW_COLS = new Set(['Check', 'Fix', 'Status']);
+
+function parseSatisfiedBy(row) {
+  const t = clean(row['Vendor Comments']);
+  if (!t) return null;
+  const m = t.match(/Satisfied\s+By\s*:\s*([\s\S]+)/i);
+  if (!m) return null;
+  const ids = m[1]
+    .split(/[,\n;]+/)
+    .map((x) => x.trim().replace(/\.+$/, '').toUpperCase())
+    .filter((x) => /^CGOS-/.test(x));
+  return ids.length ? new Set(ids) : null;
+}
+
+function setsEqual(a, b) {
+  if (!a || !b || a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+function setDelta(xSet, cSet) {
+  const added = [...cSet].filter((x) => !xSet.has(x)).sort();   // in CSV, not XLSX
+  const removed = [...xSet].filter((x) => !cSet.has(x)).sort(); // in XLSX, not CSV
+  return { added, removed };
+}
+
 function runMerge(csvRows, xlsxRows) {
   const log = [];
   log.push(`CSV: ${csvRows.length} rows · XLSX: ${xlsxRows.length} rows`);
@@ -321,8 +366,35 @@ function runMerge(csvRows, xlsxRows) {
       usedCsv.add(csvIdx[0]);
       countOneOne++;
     } else if (csvIdx.length >= 1 && xlsxIdx.length >= 1) {
-      const csvSigs = new Map(csvIdx.map((i) => [i, extractSignature(csvRows[i])]));
-      const xlsxSigs = new Map(xlsxIdx.map((i) => [i, extractSignature(xlsxRows[i])]));
+      const usedX = new Set();
+      const usedC = new Set();
+
+      // Pass 1 — pair rows that share a STIGID within this SRGID+CCI group.
+      // Same STIGID under the same key is the same control, so this prevents a
+      // CSV row from being treated as "new" (and inserted as a duplicate) when an
+      // identically-numbered baseline row already exists. STIGID is only trusted
+      // as a positive signal here; renumbered rows still fall through to Jaccard.
+      const csvByStig = new Map();
+      for (const ci of csvIdx) {
+        const sid = clean(csvRows[ci]['STIGID']);
+        if (sid && !csvByStig.has(sid)) csvByStig.set(sid, ci);
+      }
+      for (const xi of xlsxIdx) {
+        const sid = clean(xlsxRows[xi]['STIGID']);
+        if (!sid) continue;
+        const ci = csvByStig.get(sid);
+        if (ci === undefined || usedC.has(ci)) continue;
+        xlsxToCsv.set(xi, ci);
+        matchMethod.set(xi, 'STIGID within SRGID+CCI');
+        usedX.add(xi);
+        usedC.add(ci);
+        usedCsv.add(ci);
+        countSubMatch++;
+      }
+
+      // Pass 2 — Jaccard signature match for whatever is still unpaired.
+      const csvSigs = new Map(csvIdx.filter((i) => !usedC.has(i)).map((i) => [i, extractSignature(csvRows[i])]));
+      const xlsxSigs = new Map(xlsxIdx.filter((i) => !usedX.has(i)).map((i) => [i, extractSignature(xlsxRows[i])]));
       const candidates = [];
       for (const [xi, xs] of xlsxSigs) {
         if (xs.size === 0) continue;
@@ -333,8 +405,6 @@ function runMerge(csvRows, xlsxRows) {
         }
       }
       candidates.sort((a, b) => b.score - a.score);
-      const usedX = new Set();
-      const usedC = new Set();
       for (const { score, xi, ci } of candidates) {
         if (usedX.has(xi) || usedC.has(ci)) continue;
         xlsxToCsv.set(xi, ci);
@@ -346,7 +416,8 @@ function runMerge(csvRows, xlsxRows) {
       }
       for (const xi of xlsxIdx) {
         if (xlsxToCsv.has(xi)) continue;
-        if (xlsxSigs.get(xi).size === 0) ambiguousXlsx.add(xi);
+        const xs = xlsxSigs.get(xi);
+        if (xs && xs.size === 0) ambiguousXlsx.add(xi);
       }
     }
   }
@@ -374,7 +445,7 @@ function runMerge(csvRows, xlsxRows) {
   const pushAuto = (xi, ci, col, chosen, source, reason, xv, cv) => {
     resolvedCells.set(cellKey(xi, col), chosen);
     autoResolved.push({
-      xlsxRow: xlsxIndexToRow(xi),
+      xlsxRow: xlsxRows[xi].__wsRow,
       stigid: clean(csvRows[ci]['STIGID']),
       srgid: clean(xlsxRows[xi]['SRGID']),
       cci: clean(xlsxRows[xi]['CCI']),
@@ -388,18 +459,28 @@ function runMerge(csvRows, xlsxRows) {
   };
 
   for (const [xi, ci] of xlsxToCsv) {
-    if (concurredXlsxIdx.has(xi)) continue;
+    const isConcurred = concurredXlsxIdx.has(xi);
     const xr = xlsxRows[xi];
     const cr = csvRows[ci];
 
     // Row-level auto-merge: XLSX Status was a placeholder ("Not Yet Determined")
     // and Vulcan now has a real determination — take the whole row from CSV.
+    // Never bulk-replace a settled (concurred) row this way.
     const wholeRowToCsv =
+      !isConcurred &&
       norm(xr['Status']) === 'not yet determined' &&
       clean(cr['Status']) !== '' &&
       norm(cr['Status']) !== 'not yet determined';
 
+    // Umbrella detection: both sides name a "Satisfied By" base-rule set.
+    const xSat = parseSatisfiedBy(xr);
+    const cSat = parseSatisfiedBy(cr);
+    const isUmbrella = !!(xSat && cSat);
+    const satUnchanged = isUmbrella && setsEqual(xSat, cSat);
+
     for (const col of SHARED_COLS) {
+      // Settled rows: only the audit-critical columns are re-examined.
+      if (isConcurred && !CONCURRED_REVIEW_COLS.has(col)) continue;
       const cv = clean(cr[col]);
       const xv = clean(xr[col]);
       if (cv === '' || xv === '') continue;
@@ -408,6 +489,41 @@ function runMerge(csvRows, xlsxRows) {
       // Row-level: Status placeholder resolved — take CSV for the whole row.
       if (wholeRowToCsv) {
         pushAuto(xi, ci, col, cv, SOURCE.CSV, 'Status was "Not Yet Determined" — whole row taken from CSV', xv, cv);
+        continue;
+      }
+
+      // Umbrella control: Check/Fix is a representative of the Satisfied-By set,
+      // not authored text — diff the SET, not the words.
+      if (UMBRELLA_DERIVED_COLS.has(col) && isUmbrella) {
+        if (satUnchanged) {
+          // Same requirements; text differs only by which base rule is shown.
+          // Keep the approved baseline (XLSX) verbatim — no churn, no conflict.
+          pushAuto(
+            xi, ci, col, xv, SOURCE.XLSX,
+            `Umbrella control — "Satisfied By" set unchanged (${xSat.size} base rules); ${col} differs only by which base rule is surfaced`,
+            xv, cv
+          );
+          continue;
+        }
+        // Set changed → a genuine requirement change. Flag for review with the
+        // actual base-rule delta attached.
+        const delta = setDelta(xSat, cSat);
+        conflictCellSet.add(cellKey(xi, col));
+        conflicts.push({
+          id: conflictId(xi, col),
+          xlsxRow: xlsxRows[xi].__wsRow,
+          xlsxIndex: xi,
+          csvIndex: ci,
+          stigid: clean(cr['STIGID']),
+          srgid: clean(xr['SRGID']),
+          cci: clean(xr['CCI']),
+          matchMethod: matchMethod.get(xi),
+          column: col,
+          csvValue: cv,
+          xlsxValue: xv,
+          concurred: isConcurred,
+          umbrella: { added: delta.added, removed: delta.removed, xCount: xSat.size, cCount: cSat.size },
+        });
         continue;
       }
 
@@ -440,7 +556,7 @@ function runMerge(csvRows, xlsxRows) {
       conflictCellSet.add(cellKey(xi, col));
       conflicts.push({
         id: conflictId(xi, col),
-        xlsxRow: xlsxIndexToRow(xi),
+        xlsxRow: xlsxRows[xi].__wsRow,
         xlsxIndex: xi,
         csvIndex: ci,
         stigid: clean(cr['STIGID']),
@@ -450,10 +566,16 @@ function runMerge(csvRows, xlsxRows) {
         column: col,
         csvValue: cv,
         xlsxValue: xv,
+        concurred: isConcurred,
       });
     }
   }
+  const umbrellaAutoCount = autoResolved.filter((a) => /Umbrella control/.test(a.reason)).length;
+  const umbrellaConflictCount = conflicts.filter((c) => c.umbrella).length;
+  const concurredConflictCount = conflicts.filter((c) => c.concurred).length;
   log.push(`Conflicts: ${conflicts.length} need review · Auto-resolved: ${autoResolved.length}`);
+  log.push(`Umbrella (Satisfied-By) controls: ${umbrellaAutoCount} Check/Fix kept (set unchanged), ${umbrellaConflictCount} flagged (set changed)`);
+  log.push(`Concurred rows: ${concurredMatched} settled · ${concurredConflictCount} Check/Fix/Status conflicts surfaced (export still differed)`);
 
   const iter = findLatestGovIteration(xlsxRows);
   const comments = [];
@@ -468,8 +590,8 @@ function runMerge(csvRows, xlsxRows) {
       const gc = clean(r[iter.govCommentColumn]);
       if (!isMeaningfulComment(gc)) return;
       comments.push({
-        id: `comment_r${xlsxIndexToRow(i)}`,
-        xlsxRow: xlsxIndexToRow(i),
+        id: `comment_r${r.__wsRow}`,
+        xlsxRow: r.__wsRow,
         xlsxIndex: i,
         stigid: csvStigLookup.get(buildKey(r)) || '',
         srgid: clean(r['SRGID']),
@@ -493,6 +615,7 @@ function runMerge(csvRows, xlsxRows) {
     unmatchedXlsxIdx: unmatchedXlsxIdxAll.filter((i) => !ambiguousXlsx.has(i)),
     ambiguousXlsxIdx: [...ambiguousXlsx],
     concurredXlsxIdx: [...concurredXlsxIdx],
+    xlsxRowNums: xlsxRows.map((r) => r.__wsRow),
     pairings: Object.fromEntries(xlsxToCsv),
     matchMethod: Object.fromEntries(matchMethod),
     resolvedCellsMap: Object.fromEntries(resolvedCells),
@@ -509,6 +632,9 @@ function runMerge(csvRows, xlsxRows) {
       ambiguousCount: ambiguousXlsx.size,
       oneToOneCount: countOneOne,
       subMatchCount: countSubMatch,
+      umbrellaAutoCount,
+      umbrellaConflictCount,
+      concurredConflictCount,
     },
   };
 }
@@ -560,17 +686,20 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
   const concurredSet = new Set(mergeResult.concurredXlsxIdx || []);
   for (const [xiStr, ci] of Object.entries(mergeResult.pairings)) {
     const xi = parseInt(xiStr, 10);
-    if (concurredSet.has(xi)) continue; // settled row — leave untouched
+    const isConcurred = concurredSet.has(xi);
     const cr = csvRows[ci];
-    const row = ws.getRow(xlsxIndexToRow(xi));
+    const row = ws.getRow(mergeResult.xlsxRowNums[xi]);
 
-    if (colMap.has('STIGID')) {
+    // Settled rows stay untouched except for the Check/Fix/Status cells that
+    // auto-resolved or that the reviewer explicitly took from CSV.
+    if (!isConcurred && colMap.has('STIGID')) {
       row.getCell(colMap.get('STIGID')).value = clean(cr['STIGID']);
     }
 
     for (const col of SHARED_COLS) {
       if (col === 'STIGID') continue;
       if (!colMap.has(col)) continue;
+      if (isConcurred && !CONCURRED_REVIEW_COLS.has(col)) continue;
       const cIdx = colMap.get(col);
       const csvVal = clean(cr[col]);
       const cell = row.getCell(cIdx);
@@ -590,15 +719,17 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
         continue;
       }
 
-      if (existingVal === '' && csvVal !== '') {
+      if (!isConcurred && existingVal === '' && csvVal !== '') {
         cell.value = csvVal;
       }
     }
 
-    for (const col of CSV_ONLY_COLS) {
-      if (!colMap.has(col)) continue;
-      const csvVal = clean(cr[col]);
-      if (csvVal) row.getCell(colMap.get(col)).value = csvVal;
+    if (!isConcurred) {
+      for (const col of CSV_ONLY_COLS) {
+        if (!colMap.has(col)) continue;
+        const csvVal = clean(cr[col]);
+        if (csvVal) row.getCell(colMap.get(col)).value = csvVal;
+      }
     }
   }
 
@@ -608,21 +739,94 @@ async function applyAndExport({ workbook, csvRows, mergeResult, decisions, respo
       for (const cmt of mergeResult.comments) {
         const resp = (responses[cmt.id] || '').trim();
         if (resp) {
-          ws.getRow(xlsxIndexToRow(cmt.xlsxIndex)).getCell(venCol).value = resp;
+          ws.getRow(mergeResult.xlsxRowNums[cmt.xlsxIndex]).getCell(venCol).value = resp;
         }
       }
     }
   }
 
-  let newRowR = ws.rowCount + 1;
+  // Full cleanup. The baseline can carry a large block of blank rows followed by
+  // a strand of rows appended below them by a prior merge. We rebuild a single
+  // contiguous, SRGID/CCI/STIGID-ordered sheet: keep the canonical top block in
+  // place, lift every stranded row and every genuinely-new CSV row into its
+  // correct sorted position, and drop all blank rows. The sort key
+  // (primary SRGID, primary CCI, STIGID suffix) reproduces the approved DISA top
+  // block exactly, so existing rows are never reordered.
+  const srgCol = colMap.get('SRGID');
+  const cciCol = colMap.get('CCI');
+  const stigCol = colMap.get('STIGID');
+  const primary = (v) => clean(v).split(/[,\n;]+/)[0].trim(); // first token of a multi-value cell
+  const suffixOf = (v) => {
+    const m = clean(v).match(/(\d{3,})\s*$/);
+    return m ? parseInt(m[1], 10) : -1; // umbrella rows (blank STIGID) sort first within their group
+  };
+  const rowText = (r, col) => (col !== undefined ? cellText(ws.getRow(r).getCell(col).value) : '');
+  const tupleOfRow = (r) => [primary(rowText(r, srgCol)), primary(rowText(r, cciCol)), suffixOf(rowText(r, stigCol))];
+  const tupleOfVals = (v) => [primary(v['SRGID']), primary(v['CCI']), suffixOf(v['STIGID'])];
+  const cmpTuple = (a, b) =>
+    a[0] !== b[0] ? (a[0] < b[0] ? -1 : 1) : a[1] !== b[1] ? (a[1] < b[1] ? -1 : 1) : a[2] - b[2];
+
+  // Locate the first blank gap: rows before it are the canonical block; the
+  // compact rows at or after that index are stranded.
+  const rowNums = mergeResult.xlsxRowNums;
+  let firstGap = rowNums.length;
+  for (let i = 1; i < rowNums.length; i++) {
+    if (rowNums[i] - rowNums[i - 1] > 1) { firstGap = i; break; }
+  }
+  const lastTopRow = firstGap > 0 ? rowNums[firstGap - 1] : 1;
+
+  // Capture final (post-edit) values for stranded rows, then the new CSV rows.
+  const toPlace = []; // { values: {col: val}, tuple }
+  for (let i = firstGap; i < rowNums.length; i++) {
+    const r = rowNums[i];
+    const values = {};
+    for (const [colName, cIdx] of colMap) values[colName] = clean(cellText(ws.getRow(r).getCell(cIdx).value));
+    toPlace.push({ values, tuple: tupleOfVals(values) });
+  }
   for (const ci of mergeResult.newCsvIdx) {
     const cr = csvRows[ci];
-    const row = ws.getRow(newRowR);
-    for (const [colName, cIdx] of colMap) {
-      const val = clean(cr[colName]);
-      if (val) row.getCell(cIdx).value = val;
+    const values = {};
+    for (const [colName] of colMap) values[colName] = clean(cr[colName]);
+    toPlace.push({ values, tuple: tupleOfVals(values) });
+  }
+
+  // Cut everything below the canonical block (blank gap + strand). A single
+  // large-count splice is a no-op here because the blank rows are unmaterialized;
+  // splicing one row at a time reliably collapses both the gap and the strand.
+  let guard = ws.rowCount + 1;
+  while (ws.rowCount > lastTopRow && guard-- > 0) ws.spliceRows(lastTopRow + 1, 1);
+
+  // Inserted rows inherit fill via 'i+' (from the row above) or from the row
+  // below in the header-adjacent case — either of which can carry a stale
+  // changed-cell highlight (e.g. green FF92D050). Normalize every inserted row to
+  // the baseline data-row convention: the five SRG-prefix reference columns keep
+  // the gray fill, every other cell is plain white. Only the fill is overridden,
+  // so inherited font/alignment/wrap/border (Arial 11, top, wrap) are preserved.
+  const SRG_GRAY_COLS = new Set(['SRGID', 'SRG Requirement', 'SRG VulDiscussion', 'SRG Check', 'SRG Fix']);
+  const GRAY_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC0C0C0' }, bgColor: { argb: 'FFC0C0C0' } };
+  const WHITE_FILL = { type: 'pattern', pattern: 'none' };
+
+  // Insert each captured row at its sorted position. Inserting in key order means
+  // same-group rows land in suffix order next to one another.
+  toPlace.sort((a, b) => cmpTuple(a.tuple, b.tuple));
+  for (const item of toPlace) {
+    let target = ws.rowCount + 1;
+    for (let r = 2; r <= ws.rowCount; r++) {
+      if (cmpTuple(tupleOfRow(r), item.tuple) > 0) { target = r; break; }
     }
-    newRowR++;
+    // 'i+' inherits styling from the row above; for the header-adjacent case copy
+    // style from the row below instead so we don't inherit the header's style.
+    const row = ws.insertRow(target, [], target <= 2 ? 'n' : 'i+');
+    if (target <= 2 && ws.rowCount > target) {
+      const below = ws.getRow(target + 1);
+      row.eachCell({ includeEmpty: true }, (cell, c) => { cell.style = { ...below.getCell(c).style }; });
+    }
+    for (const [colName, cIdx] of colMap) {
+      const cell = row.getCell(cIdx);
+      const val = item.values[colName];
+      if (val) cell.value = val;
+      cell.fill = SRG_GRAY_COLS.has(colName) ? { ...GRAY_FILL } : { ...WHITE_FILL };
+    }
   }
 
   const buf = await workbook.xlsx.writeBuffer();
@@ -782,6 +986,9 @@ export default function App() {
           obj[h] = v;
           if (v !== '') nonEmpty = true;
         }
+        // Track the true worksheet row: the baseline has ~796 blank rows between
+        // the original table and a prior bottom-append, so compact index !== row.
+        obj.__wsRow = r;
         if (nonEmpty) rows.push(obj);
       }
 
@@ -1043,7 +1250,7 @@ export default function App() {
               <>
                 <span>{xlsxFile?.name}</span>
                 <span style={{ opacity: 0.4 }}>·</span>
-                <span>{conflicts.length} conflicts · {comments.length} comments · {reviewItems.length} rows{mergeResult?.metadata?.concurredCount ? ` · ${mergeResult.metadata.concurredCount} concurred skipped` : ''}</span>
+                <span>{conflicts.length} conflicts · {comments.length} comments · {reviewItems.length} rows{mergeResult?.metadata?.concurredCount ? ` · ${mergeResult.metadata.concurredCount} concurred` : ''}</span>
                 <span style={{ opacity: 0.4 }}>·</span>
                 <div style={{ display: 'flex', gap: 4 }}>
                   <button style={iconBtn(view === 'review')} onClick={() => setView('review')}>
@@ -1279,19 +1486,33 @@ export default function App() {
               {mergeResult?.log.map((l, i) => <div key={i}>· {l}</div>)}
             </div>
 
-            <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Concurred rows skipped</h3>
+            <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Concurred rows</h3>
             <p style={{ fontSize: 14, color: COLORS.inkSoft }}>
               {mergeResult?.metadata?.concurredCount || 0} matched rows are already settled — the latest Government
-              Comments cell starts with "Concur" <em>or</em> the latest Vendor Response contains "Concur". Vulcan's
-              data for these is stale, so they're skipped entirely and left untouched in the export.
+              Comments cell starts with "Concur" <em>or</em> the latest Vendor Response contains "Concur". These are
+              left untouched in the export <em>except</em> for the audit-critical columns (<strong>Check</strong>,
+              {' '}<strong>Fix</strong>, <strong>Status</strong>): if Vulcan's export still disagrees with the baseline
+              there, the cell is surfaced as a conflict tagged "previously concurred" so a stray live change can't be
+              silently dropped. {mergeResult?.metadata?.concurredConflictCount || 0} such conflicts were surfaced.
             </p>
 
             <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Auto-resolved</h3>
             <p style={{ fontSize: 14, color: COLORS.inkSoft }}>
-              {mergeResult?.autoResolved.length || 0} cells auto-resolved without review, by three rules:
+              {mergeResult?.autoResolved.length || 0} cells auto-resolved without review, by four rules:
               (1) when XLSX <em>Status</em> was "Not Yet Determined", the whole row is taken from CSV;
               (2) when a cell's only difference is "operating system" → "Chainguard OS", the Chainguard OS
-              wording wins; (3) on the Requirement column, the side that says "Chainguard OS" is preferred.
+              wording wins; (3) on the Requirement column, the side that says "Chainguard OS" is preferred;
+              (4) on umbrella controls (those with a "Satisfied By" list), <em>Check</em> and <em>Fix</em> are
+              compared by their base-rule SET rather than their text — if the set is unchanged the baseline
+              XLSX text is kept (the differing text is only a different representative of the same rules).
+            </p>
+
+            <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Umbrella ("Satisfied By") controls</h3>
+            <p style={{ fontSize: 14, color: COLORS.inkSoft }}>
+              {mergeResult?.metadata?.umbrellaAutoCount || 0} Check/Fix cells were kept because the control's
+              "Satisfied By" base-rule set was unchanged (the text only differs by which base rule is surfaced).
+              {' '}{mergeResult?.metadata?.umbrellaConflictCount || 0} umbrella controls were flagged as real
+              conflicts because their base-rule set actually changed — those show the added/removed rules.
             </p>
 
             <h3 style={{ fontSize: 13, fontWeight: 600, margin: '20px 0 10px', fontFamily: MONO, textTransform: 'uppercase', letterSpacing: '0.06em', color: COLORS.inkSoft }}>Keyboard — Review</h3>
@@ -1324,7 +1545,7 @@ export default function App() {
                 <span><strong>{summary.stats.totalResponses}</strong> responses entered</span>
                 <span><strong>{summary.stats.totalNewRows}</strong> new rows added</span>
                 {mergeResult?.metadata?.concurredCount > 0 && (
-                  <span><strong style={{ color: COLORS.xlsx }}>{mergeResult.metadata.concurredCount}</strong> concurred rows skipped (untouched)</span>
+                  <span><strong style={{ color: COLORS.xlsx }}>{mergeResult.metadata.concurredCount}</strong> concurred (Check/Fix/Status re-checked){mergeResult?.metadata?.concurredConflictCount ? ` · ${mergeResult.metadata.concurredConflictCount} surfaced` : ''}</span>
                 )}
               </div>
               <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -1537,8 +1758,10 @@ export default function App() {
                     <div key={c.id}
                          id={`conflict-${c.id}`}
                          style={{ display: 'grid', gridTemplateColumns: '180px 1fr 1fr', borderTop: ci === 0 ? 'none' : '1px solid ' + COLORS.rule, scrollMarginTop: 80 }}>
-                      {/* Gutter: column name + status pill, spans both content rows */}
-                      <div style={{ gridRow: 'span 3', padding: '14px 16px', background: COLORS.bg, borderRight: '1px solid ' + COLORS.rule, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {/* Gutter: column name + status pill. Spans every content row —
+                          headers + diffs + buttons (3) plus one per optional banner —
+                          so the buttons stay in the XLSX/CSV columns, not under the gutter. */}
+                      <div style={{ gridRow: `span ${3 + (c.umbrella ? 1 : 0) + (c.concurred ? 1 : 0)}`, padding: '14px 16px', background: COLORS.bg, borderRight: '1px solid ' + COLORS.rule, display: 'flex', flexDirection: 'column', gap: 8 }}>
                         <div style={{ fontFamily: SERIF, fontStyle: 'italic', fontSize: 18, fontWeight: 500, color: COLORS.ink, lineHeight: 1.2 }}>
                           {c.column}
                         </div>
@@ -1554,6 +1777,35 @@ export default function App() {
                           <span onClick={() => clearDecision(c.id)} style={{ fontFamily: MONO, fontSize: 11, color: COLORS.inkSoft, cursor: 'pointer', textDecoration: 'underline' }}>clear</span>
                         )}
                       </div>
+
+                      {/* Umbrella set-change banner — the real signal is the
+                          base-rule delta, not the representative text diff. */}
+                      {c.umbrella && (
+                        <div style={{ gridColumn: '2 / 4', padding: '10px 14px', borderBottom: '1px solid ' + COLORS.rule, background: COLORS.warnBg, fontFamily: MONO, fontSize: 11, lineHeight: 1.6, color: '#5e3a16' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase', marginBottom: 4 }}>
+                            <AlertTriangle size={12} /> "Satisfied By" set changed · {c.umbrella.xCount} → {c.umbrella.cCount} base rules
+                          </div>
+                          <div>This is an umbrella control — its {c.column} text is just a representative of its base rules. The substantive change is which base rules satisfy it:</div>
+                          {c.umbrella.added.length > 0 && (
+                            <div style={{ marginTop: 3 }}><span style={{ color: COLORS.addFg, fontWeight: 600 }}>+ added (CSV):</span> {c.umbrella.added.join(', ')}</div>
+                          )}
+                          {c.umbrella.removed.length > 0 && (
+                            <div style={{ marginTop: 3 }}><span style={{ color: COLORS.delFg, fontWeight: 600 }}>− removed (XLSX):</span> {c.umbrella.removed.join(', ')}</div>
+                          )}
+                          <div style={{ marginTop: 4, fontStyle: 'italic', opacity: 0.85 }}>The text panels below differ only by representative selection — decide based on the set change above.</div>
+                        </div>
+                      )}
+
+                      {/* Previously-concurred banner — this row was marked settled
+                          ("Concur…") yet the export still diverges here. */}
+                      {c.concurred && (
+                        <div style={{ gridColumn: '2 / 4', padding: '10px 14px', borderBottom: '1px solid ' + COLORS.rule, background: COLORS.warnBg, fontFamily: MONO, fontSize: 11, lineHeight: 1.6, color: '#5e3a16' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                            <AlertTriangle size={12} /> Previously concurred — export still differs
+                          </div>
+                          <div style={{ marginTop: 3 }}>This row was marked settled ("Concur"), so it was otherwise skipped — but Vulcan's {c.column} still disagrees with the baseline. Decide whether this is a live change to merge.</div>
+                        </div>
+                      )}
 
                       {/* XLSX header */}
                       <div style={{ padding: '8px 14px', borderBottom: '1px solid ' + COLORS.rule, borderRight: '1px solid ' + COLORS.rule, background: COLORS.xlsxSoft, display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}>
