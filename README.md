@@ -35,65 +35,6 @@ To preview the production build locally before deploying:
 npm run preview
 ```
 
-## Deploy
-
-### Netlify
-
-1. Push the repo to GitHub/GitLab.
-2. In Netlify: **Add new site → Import an existing project**.
-3. Set build command: `npm run build`
-4. Set publish directory: `dist`
-5. Deploy.
-
-Or via CLI:
-
-```bash
-npm install -g netlify-cli
-netlify deploy --prod --dir dist
-```
-
-### Vercel
-
-```bash
-npm install -g vercel
-vercel --prod
-```
-
-Vercel auto-detects Vite. No configuration needed.
-
-### GitHub Pages
-
-1. Install the deploy plugin:
-
-```bash
-npm install -D gh-pages
-```
-
-2. Add to `package.json` scripts:
-
-```json
-"deploy": "npm run build && gh-pages -d dist"
-```
-
-3. Run:
-
-```bash
-npm run deploy
-```
-
-### Any static host (S3, nginx, Caddy, etc.)
-
-Run `npm run build`, then serve the contents of `dist/` as static files. The app is entirely client-side — no server required.
-
-If you're serving from a sub-path (e.g. `https://example.com/stig-compare/`), set the base in `vite.config.js`:
-
-```js
-export default defineConfig({
-  base: '/stig-compare/',
-  plugins: [react()],
-});
-```
-
 ## Usage
 
 1. Open the app in a browser.
@@ -105,7 +46,54 @@ export default defineConfig({
 
 Progress is saved automatically to `localStorage` keyed by filename + size, so you can close the tab and resume.
 
+## How matching and merging work
+
+The XLSX is treated as the **trusted, DISA-approved baseline**; the CSV is a fresh Vulcan export whose changes are merged *into* it. The whole pipeline lives in `merge_review.jsx` (`runMerge` for analysis, `applyAndExport` for writing).
+
+### 1. Join key
+
+Rows are joined on **`SRGID + CCI`** — not STIGID. STIGID renumbers between exports (a large fraction of rules get a new 6-digit suffix each round), so it is unreliable as a global identifier. `SRGID + CCI` is stable, but it is **not unique**: several rules can share one key (e.g. the audit-syscall family under `SRG-OS-000037-GPOS-00015 / CCI-000130` holds many rows), so a single key can map a *group* of CSV rows to a *group* of XLSX rows.
+
+### 2. Matching within a key group
+
+For each `SRGID + CCI` key:
+
+- **1 × 1** — exactly one row on each side → matched directly.
+- **N × M** — multiple rows on either side are sub-matched in two passes:
+  1. **STIGID pairing.** Rows that share the same STIGID under the key are the same control, so they are paired first. This stops a CSV row from being treated as "new" (and inserted as a duplicate) when an identically-numbered baseline row already exists. STIGID is used only as a *positive* signal — renumbered rows simply fall through to the next pass.
+  2. **Jaccard signature.** Remaining rows are paired by content similarity. A signature is extracted from `Requirement / Check / Fix / VulDiscussion` — file paths, quoted strings, and technical tokens (`syscall`, `chmod`, octal modes like `0644`, `systemctl`, …) — and rows are matched greedily, highest score first, at a similarity threshold of **0.30**.
+
+CSV rows that never match become **new rows** (inserted in place — see §5). Unmatched XLSX rows whose signature is empty are flagged **ambiguous** rather than silently dropped.
+
+### 3. Concurrence gate
+
+A row is considered **settled** when its review history shows concurrence: the latest non-empty *Government Comments* cell starts with "concur" (but not "non-concur"), **or** the latest *Vendor Response* contains "concur" (not "non-concur"). Iteration columns are `Nth Government Comments` / `Nth Vendor Response`; the highest-numbered non-empty cell wins.
+
+Settled rows are **not** skipped wholesale — the Vulcan export can still carry a live divergence on a row that already reads "Concur." Instead, only the audit-critical columns **Check / Fix / Status** are re-examined on settled rows; every other column is left as the approved baseline.
+
+### 4. Per-column resolution
+
+For every matched pair, each shared column is compared (blank-vs-blank and whitespace-only differences are ignored). Differences are auto-resolved in this order, and whatever is left becomes a **conflict** for manual review:
+
+1. **Status placeholder → whole row from CSV.** If the XLSX `Status` is `Not Yet Determined` and the CSV has a real determination, the entire row is taken from the CSV. (Never applied to a settled row.)
+2. **Umbrella controls.** Many SRG rows carry a `Satisfied By: CGOS-…, CGOS-…` list in *Vendor Comments*; for these, `Check` / `Fix` is a *rendering* of the first-listed base rule, not authored text, so it changes purely from list reordering. These columns are compared by the **set** of base rules, not the text:
+   - set unchanged → keep the baseline XLSX verbatim (no churn, no conflict);
+   - set changed → real requirement change, surfaced as a conflict with the added/removed base rules shown.
+3. **OS phrasing.** If the only difference is `operating system` → `Chainguard OS`, the Chainguard wording wins automatically.
+4. **Requirement preference.** In the `Requirement` column, the side that says `Chainguard OS` is preferred over generic `operating system` phrasing.
+
+Undecided conflicts default to keeping the baseline (XLSX) on export until you pick a side in the UI.
+
+### 5. Writing the merged XLSX
+
+Export writes decisions back into the **original workbook** with ExcelJS, so cell styling (font, alignment, borders, fills) is preserved.
+
+- **True-row mapping.** The baseline can contain a large block of blank rows and a strand of rows appended by a prior merge, so the compact parse index is not the worksheet row number. Each parsed row carries its real worksheet row, and every read/write/insert uses it.
+- **In-place insertion.** New rows are inserted into their `SRGID + CCI` group in STIGID-suffix order — sorted by `(primary SRGID token, primary CCI token, STIGID 6-digit suffix)` — rather than appended at the bottom. This sort reproduces the approved DISA ordering exactly, so existing rows are never reordered.
+- **Full cleanup.** Blank-row gaps are collapsed and any stranded rows from a previous merge are lifted back into their correct sorted position, producing one contiguous, ordered sheet.
+- **Fill normalization.** Inserted rows are reset to the baseline convention: the five SRG-prefix reference columns (`SRGID`, `SRG Requirement`, `SRG VulDiscussion`, `SRG Check`, `SRG Fix`) keep the gray fill, every other cell is white — so an inserted row never inherits a stale changed-cell highlight from its neighbor.
+
 ## Notes
 
-- Cell formatting (colors, styles) in the original XLSX is not preserved in the exported file. This is a limitation of the SheetJS community edition used in the browser. If preserving review color-coding matters, run the merge server-side with openpyxl.
-- The `xlsx` package has known audit warnings in its community edition. The app uses it only to read and write user-supplied local files, so there is no server-side exposure.
+- Reading and writing both use [ExcelJS](https://github.com/exceljs/exceljs) in the browser, which **preserves** the original workbook's cell formatting (fonts, alignment, borders, fills) in the exported file.
+- The app is entirely client-side — uploaded files never leave the browser. CSV parsing uses PapaParse; XLSX read/write uses ExcelJS.
