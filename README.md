@@ -35,6 +35,19 @@ To preview the production build locally before deploying:
 npm run preview
 ```
 
+## Tests
+
+```bash
+npm test
+```
+
+The merge logic (matching, concurrence gate, umbrella handling, auto-resolve rules) lives in `merge_logic.js` — a plain-JS module with no React or DOM dependencies, imported by both the app (`merge_review.jsx`) and the test suite:
+
+- `test/merge_logic.test.mjs` — unit tests for the helpers plus `runMerge` scenarios on synthetic rows (concurrence gating, umbrella Satisfied-By sets, STIGID-first pairing, Jaccard sub-matching, OS-phrasing auto-resolve, Not-Yet-Determined row replacement).
+- `test/merge_integration.test.mjs` — characterization test that runs the real DISA baseline × Vulcan export merge and pins the verified outcome (17 conflicts, 97 concurred, 47 umbrella auto-keeps, 14 new rows). The real data files under `test/` are local-only (gitignored); the test skips when they're absent.
+
+`fixtures/make_fixtures.mjs` generates a small synthetic CSV/XLSX pair for exercising the app end-to-end in the browser, and `fixtures/check_export.mjs` asserts on the exported result.
+
 ## Usage
 
 1. Open the app in a browser.

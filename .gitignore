@@ -11,3 +11,9 @@ fixtures/real/
 fixtures/*.csv
 fixtures/*.xlsx
 .playwright-mcp/
+
+# Local STIG data used by the integration test (real exports; never committed)
+test/*.xlsx
+test/*.csv
+test/*.xml
+test/ChainguardOS--stig-baseline/
